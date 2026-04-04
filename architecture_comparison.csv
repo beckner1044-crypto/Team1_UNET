@@ -1,0 +1,5 @@
+architecture,dice_coef,iou_coef
+unet,0.9527,0.9096
+unet++,0.9513,0.9072
+unet3++,0.0664,
+nnunet,,

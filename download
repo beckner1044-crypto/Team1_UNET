@@ -1,0 +1,25 @@
+# Large model weights (use Google Drive — best_unetpp.keras is ~94MB)
+*.keras
+*.h5
+*.pt
+*.pth
+*.onnx
+
+# Large raw data
+*.npz
+*.nii.gz
+*.tar
+*.tar.gz
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Colab
+.colab/
