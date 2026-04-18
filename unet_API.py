@@ -98,6 +98,75 @@ def preprocess(images, masks):
     """
     ...
 
+def normalize_images(images):
+    """
+    Make image array shape compatible with prepare_dataset().
+ 
+    Handles common cases:
+        (H, W)       → (1, H, W, 1)
+        (N, H, W)    → (N, H, W, 1)
+        (H, W, C)    → (1, H, W, C)   where C is 1 or 3
+        (N, H, W, C) → passed through
+ 
+    Parameters
+    ----------
+    images : np.ndarray
+ 
+    Returns
+    -------
+    np.ndarray with shape (N, H, W, 1) or (N, H, W, 3)
+    """
+    if images.ndim == 2:
+        images = images[np.newaxis, ..., np.newaxis]
+    elif images.ndim == 3:
+        if images.shape[-1] in (1, 3):
+            images = images[np.newaxis, ...]
+        else:
+            images = images[..., np.newaxis]
+    elif images.ndim == 4:
+        pass
+    else:
+        raise ValueError(f"Unsupported image shape: {images.shape}")
+ 
+    if images.shape[-1] not in (1, 3):
+        raise ValueError(
+            f"Images must end with channel dimension 1 or 3. Got shape {images.shape}"
+        )
+ 
+    return images
+ 
+ 
+def normalize_masks(masks):
+    """
+    Make mask array shape compatible with prepare_dataset().
+ 
+    Handles common cases:
+        (H, W)       → (1, H, W, 1)
+        (N, H, W)    → (N, H, W, 1)
+        (N, H, W, 1) → passed through
+ 
+    Parameters
+    ----------
+    masks : np.ndarray
+ 
+    Returns
+    -------
+    np.ndarray with shape (N, H, W, 1)
+    """
+    if masks.ndim == 2:
+        masks = masks[np.newaxis, ..., np.newaxis]
+    elif masks.ndim == 3:
+        if masks.shape[-1] == 1 and masks.shape[0] != 1:
+            pass
+        else:
+            masks = masks[..., np.newaxis]
+    elif masks.ndim == 4:
+        pass
+    else:
+        raise ValueError(f"Unsupported mask shape: {masks.shape}")
+ 
+    return masks
+
 
 # =============================================================================
 # Superclass — defines what ALL segmentation models must do
@@ -646,68 +715,59 @@ class NnUNetSegModel(SegModel):
         print(result.stdout)
         return result.stdout
  
-    def fit(self, X_train=None, y_train=None, fold=0, save_softmax=False):
-        """
-        Train nnU-Net model.
- 
-        If X_train and y_train are provided, runs the full pipeline:
-            1) prepare_dataset()       → nnUNet_raw/<dataset>/
-            2) validate_dataset()      → check structure
-            3) plan_and_preprocess()   → nnUNet_preprocessed/
-            4) train                   → nnUNet_results/
- 
-        If they are None, assumes data is already prepared and preprocessed,
-        and only runs the training step.
- 
-        Parameters
-        ----------
-        X_train : np.ndarray or None — training images
-        y_train : np.ndarray or None — training masks
-        fold : int or str — 0-4 for single fold, "all" for all 5
-        save_softmax : bool — if True, passes --npz for ensembling
- 
-        Returns self.
-        """
-        import os
-        import subprocess
- 
-        if X_train is not None and y_train is not None:
-            self.setup_environment()
-            self.prepare_dataset(X_train, y_train)
-            self.validate_dataset()
-            self.plan_and_preprocess()
- 
-        nnunet_results = os.environ.get("nnUNet_results")
-        if nnunet_results is None:
-            raise EnvironmentError("nnUNet_results is not set. Call setup_environment() first.")
- 
-        folds_to_train = [0, 1, 2, 3, 4] if fold == "all" else [int(fold)]
- 
-        for f in folds_to_train:
-            print(f"\n{'='*60}")
-            print(f"  Training fold {f}")
-            print(f"{'='*60}")
- 
-            cmd = ["nnUNetv2_train", str(self.dataset_id), self.configuration, str(f)]
-            if save_softmax:
-                cmd.append("--npz")
- 
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                print(f"STDOUT:\n{result.stdout}")
-                print(f"STDERR:\n{result.stderr}")
-                raise RuntimeError(f"nnUNetv2_train failed on fold {f} (exit code {result.returncode})")
-            print(f"✓ Fold {f} complete")
- 
-        self.model_folder = os.path.join(
-            nnunet_results, self.dataset_name,
-            f"nnUNetTrainer__nnUNetPlans__{self.configuration}",
-        )
-        self.folds = tuple(folds_to_train)
-        self._load_predictor()
- 
-        print(f"\n✓ Training complete — {len(folds_to_train)} fold(s)")
-        return self
+def fit(self, X_train=None, y_train=None, folds="all_cv",
+        save_softmax=False, continue_training=False):
+    import os
+    import subprocess
+
+    if X_train is not None and y_train is not None:
+        self.setup_environment()
+        self.prepare_dataset(X_train, y_train)
+        self.validate_dataset()
+        self.plan_and_preprocess()
+
+    nnunet_results = os.environ.get("nnUNet_results")
+    if nnunet_results is None:
+        raise EnvironmentError("nnUNet_results is not set. Call setup_environment() first.")
+
+    if folds == "all_cv":
+        folds_to_train = [0, 1, 2, 3, 4]
+    else:
+        folds_to_train = [int(folds)]
+
+    for f in folds_to_train:
+        print(f"\n{'='*60}")
+        print(f"  Training fold {f}")
+        print(f"{'='*60}")
+
+        cmd = ["nnUNetv2_train", str(self.dataset_id), self.configuration, str(f)]
+
+        if save_softmax:
+            cmd.append("--npz")
+
+        if continue_training:
+            cmd.append("--c")
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"STDOUT:\n{result.stdout}")
+            print(f"STDERR:\n{result.stderr}")
+            raise RuntimeError(
+                f"nnUNetv2_train failed on fold {f} (exit code {result.returncode})"
+            )
+
+        print(f"✓ Fold {f} complete")
+
+    self.model_folder = os.path.join(
+        nnunet_results,
+        self.dataset_name,
+        f"nnUNetTrainer__nnUNetPlans__{self.configuration}",
+    )
+    self.folds = tuple(folds_to_train)
+    self._load_predictor()
+
+    print(f"\n✓ Training complete — {len(folds_to_train)} fold(s)")
+    return self
  
     # ------------------------------------------------------------------
     # Step 9: Inference
