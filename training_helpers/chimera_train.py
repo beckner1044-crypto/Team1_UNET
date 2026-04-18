@@ -218,7 +218,7 @@ def _per_sample_dice(pred_batch, gt_batch, smooth=SMOOTH):
 def get_model(name):
     """Return a PyTorch model for unet / unet++ / unet3++."""
     import segmentation_models_pytorch as smp
-    from unet3plus import UNet3Plus
+    from training_helpers.unet3plus import UNet3Plus
 
     name = name.lower().strip()
 
