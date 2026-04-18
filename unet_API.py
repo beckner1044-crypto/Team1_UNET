@@ -42,6 +42,7 @@ Usage:
 """
 
 from abc import ABC, abstractmethod
+import os
 import numpy as np
 
 
@@ -228,17 +229,17 @@ class KerasSegModel(SegModel):
 class NnUNetSegModel(SegModel):
     """
     Wraps nnU-Net v2 (training via CLI/Python API, inference via nnUNetPredictor).
-
+ 
     Expects data converted into nnU-Net's folder layout:
         <nnUNet_raw>/<dataset_name>/imagesTr/case_XXXX_0000.nii.gz
         <nnUNet_raw>/<dataset_name>/labelsTr/case_XXXX.nii.gz
         <nnUNet_raw>/<dataset_name>/dataset.json
     """
-
+ 
     def __init__(self, dataset_name, model_folder=None,
                  configuration="2d", folds=(0,),
                  checkpoint_name="checkpoint_final.pth",
-                 device="cuda", threshold=0.5):
+                 device="cuda", threshold=0.5, dataset_id=101):
         super().__init__(f"nnunet-{configuration}", threshold)
         self.dataset_name = dataset_name        # e.g. "Dataset101_CardiacUS"
         self.model_folder = model_folder        # nnUNet_results/<dataset>/nnUNetTrainer__nnUNetPlans__2d
@@ -246,10 +247,11 @@ class NnUNetSegModel(SegModel):
         self.folds = folds                      # CV folds used for ensemble inference
         self.checkpoint_name = checkpoint_name  # "checkpoint_final.pth" or "checkpoint_best.pth"
         self.device = device                    # "cuda" | "cpu"
+        self.dataset_id = dataset_id            # numeric ID used by nnU-Net CLI commands
         self._predictor = None                  # nnUNetPredictor; built lazily
         if model_folder is not None:
             self._load_predictor()
-
+ 
     @classmethod
     def from_checkpoint(cls, model_folder, dataset_name,
                         configuration="2d", folds=(0,),
@@ -265,13 +267,459 @@ class NnUNetSegModel(SegModel):
             device=device,
             threshold=threshold,
         )
+ 
+    # ------------------------------------------------------------------
+    # Step 1: Environment setup
+    # ------------------------------------------------------------------
 
+    def _check_environment(self):
+        import os
+
+        required_vars = ["nnUNet_raw", "nnUNet_preprocessed", "nnUNet_results"]
+        missing = [v for v in required_vars if os.environ.get(v) is None]
+
+        if missing:
+            raise EnvironmentError(
+                f"Missing nnU-Net environment variables: {missing}\n"
+                "Call setup_environment(base_dir=...) first."
+            )
+
+    def setup_environment(self, base_dir=None):
+        """
+        Check and set nnU-Net environment variables (nnUNet_raw,
+        nnUNet_preprocessed, nnUNet_results). Must be called before training.
+ 
+        If base_dir is provided, creates the directory structure and sets
+        the env vars. If not provided, validates they are already set.
+ 
+        Parameters
+        ----------
+        base_dir : str or None
+            Root directory for nnU-Net data.
+ 
+        Returns
+        -------
+        dict — {"nnUNet_raw": ..., "nnUNet_preprocessed": ..., "nnUNet_results": ...}
+        """
+        import os
+ 
+        required_vars = ["nnUNet_raw", "nnUNet_preprocessed", "nnUNet_results"]
+ 
+        if base_dir is not None:
+            os.makedirs(base_dir, exist_ok=True)
+            paths = {}
+            for var in required_vars:
+                path = os.path.join(base_dir, var)
+                os.makedirs(path, exist_ok=True)
+                os.environ[var] = path
+                paths[var] = path
+            print(f"✓ Environment configured at {base_dir}")
+            for var, path in paths.items():
+                print(f"  {var} = {path}")
+            return paths
+ 
+        paths = {}
+        missing = []
+        for var in required_vars:
+            val = os.environ.get(var)
+            if val is None:
+                missing.append(var)
+            else:
+                paths[var] = val
+ 
+        if missing:
+            raise EnvironmentError(
+                f"Missing nnU-Net environment variables: {missing}\n"
+                f"Either set them manually or call "
+                f"setup_environment('/path/to/base_dir') to create them."
+            )
+ 
+        print("✓ Environment variables verified")
+        for var, path in paths.items():
+            exists = "✓" if os.path.isdir(path) else "✗ NOT FOUND"
+            print(f"  {var} = {path}  [{exists}]")
+ 
+        return paths
+ 
+    # ------------------------------------------------------------------
+    # Step 2-4: Data conversion + folder layout
+    # ------------------------------------------------------------------
+    def prepare_dataset(self, images, masks, file_format="nifti"):
+        """
+        Convert numpy arrays into nnU-Net's required folder structure.
+ 
+        Parameters
+        ----------
+        images : np.ndarray
+            For nifti: shape (N, H, W, 1) float32 grayscale
+            For png:   shape (N, H, W, 3) uint8 RGB  OR  (N, H, W, 1) float32
+        masks : np.ndarray
+            Shape (N, H, W, 1) or (N, H, W) with values {0, 1} or {0, 255}
+        file_format : str
+            "nifti" or "png"
+ 
+        Returns
+        -------
+        str — path to the created dataset directory
+        """
+        import os
+        import json
+ 
+        if file_format not in ("nifti", "png"):
+            raise ValueError(f"file_format must be 'nifti' or 'png', got '{file_format}'")
+ 
+        nnunet_raw = os.environ.get("nnUNet_raw")
+        if nnunet_raw is None:
+            raise EnvironmentError("nnUNet_raw is not set. Call setup_environment() first.")
+ 
+        dataset_dir = os.path.join(nnunet_raw, self.dataset_name)
+        images_dir = os.path.join(dataset_dir, "imagesTr")
+        labels_dir = os.path.join(dataset_dir, "labelsTr")
+        os.makedirs(images_dir, exist_ok=True)
+        os.makedirs(labels_dir, exist_ok=True)
+ 
+        # Normalize mask shape to (N, H, W)
+        masks_2d = masks.squeeze() if masks.ndim == 4 else masks
+        if masks_2d.ndim == 2:
+            masks_2d = masks_2d[np.newaxis, ...]
+ 
+        # Validate and normalize mask values
+        unique_vals = np.unique(masks_2d)
+        if np.array_equal(unique_vals, np.array([0, 255], dtype=unique_vals.dtype)):
+            print("  Converting masks from [0, 255] to [0, 1]")
+            masks_2d = (masks_2d > 0).astype(np.uint8)
+        elif not np.all(np.isin(unique_vals, [0, 1])):
+            raise ValueError(
+                f"Expected binary masks with values [0,1] or [0,255], "
+                f"got unique values: {unique_vals}"
+            )
+        else:
+            masks_2d = masks_2d.astype(np.uint8)
+ 
+        if file_format == "png":
+            self._write_png_cases(images, masks_2d, images_dir, labels_dir)
+            file_ending = ".png"
+            if images.ndim == 4 and images.shape[-1] == 3:
+                channel_names = {"0": "R", "1": "G", "2": "B"}
+            else:
+                channel_names = {"0": "grayscale"}
+        else:
+            self._write_nifti_cases(images, masks_2d, images_dir, labels_dir)
+            file_ending = ".nii.gz"
+            channel_names = {"0": "ultrasound"}
+ 
+        dataset_json = {
+            "channel_names": channel_names,
+            "labels": {"background": 0, "foreground": 1},
+            "numTraining": len(images),
+            "file_ending": file_ending,
+            "name": self.dataset_name,
+            "description": "Cardiac ultrasound segmentation",
+        }
+ 
+        with open(os.path.join(dataset_dir, "dataset.json"), "w") as f:
+            json.dump(dataset_json, f, indent=2)
+ 
+        print(f"✓ Wrote {len(images)} cases to {dataset_dir}")
+        print(f"  Format: {file_format} ({file_ending})")
+        print(f"  imagesTr: {len(images)} files")
+        print(f"  labelsTr: {len(images)} files")
+        return dataset_dir
+ 
+    def _write_nifti_cases(self, images, masks_2d, images_dir, labels_dir):
+        """Write image/mask pairs as NIfTI .nii.gz files."""
+        import os
+        try:
+            import nibabel as nib
+        except ImportError:
+            raise ImportError("nibabel is required for NIfTI. Install with: pip install nibabel")
+ 
+        affine = np.eye(4)
+        for i in range(len(images)):
+            case_id = f"case_{i:04d}"
+            img_2d = images[i].squeeze().astype(np.float32)
+            img_nifti = nib.Nifti1Image(img_2d[..., np.newaxis], affine)
+            mask_nifti = nib.Nifti1Image(masks_2d[i][..., np.newaxis], affine)
+            nib.save(img_nifti, os.path.join(images_dir, f"{case_id}_0000.nii.gz"))
+            nib.save(mask_nifti, os.path.join(labels_dir, f"{case_id}.nii.gz"))
+ 
+    def _write_png_cases(self, images, masks_2d, images_dir, labels_dir):
+        """Write image/mask pairs as PNG files."""
+        import os
+        try:
+            from PIL import Image
+        except ImportError:
+            raise ImportError("Pillow is required for PNG. Install with: pip install Pillow")
+ 
+        for i in range(len(images)):
+            case_id = f"case_{i:04d}"
+            img = images[i]
+ 
+            if img.ndim == 3 and img.shape[-1] == 3:
+                if img.dtype != np.uint8:
+                    img = np.clip(img * 255 if img.max() <= 1.0 else img, 0, 255).astype(np.uint8)
+                Image.fromarray(img).save(os.path.join(images_dir, f"{case_id}_0000.png"))
+            elif img.ndim == 3 and img.shape[-1] == 1:
+                img_2d = img.squeeze()
+                if img_2d.dtype != np.uint8:
+                    img_2d = np.clip(img_2d * 255 if img_2d.max() <= 1.0 else img_2d, 0, 255).astype(np.uint8)
+                Image.fromarray(img_2d, mode="L").save(os.path.join(images_dir, f"{case_id}_0000.png"))
+            else:
+                raise ValueError(f"Image {i} has unexpected shape {img.shape}. Expected (H,W,3) or (H,W,1).")
+ 
+            Image.fromarray(masks_2d[i].astype(np.uint8)).save(os.path.join(labels_dir, f"{case_id}.png"))
+ 
+    # ------------------------------------------------------------------
+    # Step 5: Validation
+    # ------------------------------------------------------------------
+    def validate_dataset(self):
+        """
+        Check that the dataset directory is correctly structured for nnU-Net.
+        Detects file format from dataset.json automatically.
+ 
+        Returns True if all checks pass, raises ValueError with details if not.
+        """
+        import os
+        import json
+        import re
+ 
+        nnunet_raw = os.environ.get("nnUNet_raw")
+        if nnunet_raw is None:
+            raise EnvironmentError("nnUNet_raw is not set. Call setup_environment() first.")
+ 
+        dataset_dir = os.path.join(nnunet_raw, self.dataset_name)
+        errors = []
+ 
+        if not os.path.isdir(dataset_dir):
+            raise FileNotFoundError(f"Dataset directory not found: {dataset_dir}\nCall prepare_dataset() first.")
+ 
+        json_path = os.path.join(dataset_dir, "dataset.json")
+        ds = {}
+        if not os.path.isfile(json_path):
+            errors.append("dataset.json is missing")
+        else:
+            with open(json_path) as f:
+                ds = json.load(f)
+            for field in ["channel_names", "labels", "numTraining", "file_ending"]:
+                if field not in ds:
+                    errors.append(f"dataset.json missing required field: '{field}'")
+            if "labels" in ds:
+                if "background" not in ds["labels"]:
+                    errors.append("dataset.json labels missing 'background'")
+                if ds["labels"].get("background") != 0:
+                    errors.append("dataset.json labels['background'] should be 0")
+ 
+        file_ending = ds.get("file_ending", ".nii.gz")
+        images_dir = os.path.join(dataset_dir, "imagesTr")
+        labels_dir = os.path.join(dataset_dir, "labelsTr")
+ 
+        if not os.path.isdir(images_dir):
+            errors.append("imagesTr/ directory is missing")
+        if not os.path.isdir(labels_dir):
+            errors.append("labelsTr/ directory is missing")
+ 
+        image_files = []
+        label_files = []
+ 
+        if os.path.isdir(images_dir) and os.path.isdir(labels_dir):
+            image_files = sorted([f for f in os.listdir(images_dir) if f.endswith(file_ending)])
+            label_files = sorted([f for f in os.listdir(labels_dir) if f.endswith(file_ending)])
+ 
+            if "numTraining" in ds and len(image_files) != ds["numTraining"]:
+                errors.append(f"Image count ({len(image_files)}) doesn't match dataset.json numTraining ({ds['numTraining']})")
+ 
+            ext_escaped = re.escape(file_ending)
+            img_pattern = re.compile(rf"^case_\d{{4}}_0000{ext_escaped}$")
+            lbl_pattern = re.compile(rf"^case_\d{{4}}{ext_escaped}$")
+ 
+            bad_images = [f for f in image_files if not img_pattern.match(f)]
+            bad_labels = [f for f in label_files if not lbl_pattern.match(f)]
+ 
+            if bad_images:
+                errors.append(f"{len(bad_images)} images don't follow naming convention: {bad_images[:3]}...")
+            if bad_labels:
+                errors.append(f"{len(bad_labels)} labels don't follow naming convention: {bad_labels[:3]}...")
+ 
+            suffix_img = f"_0000{file_ending}"
+            image_ids = {f.replace(suffix_img, "") for f in image_files}
+            label_ids = {f.replace(file_ending, "") for f in label_files}
+ 
+            if image_ids - label_ids:
+                errors.append(f"{len(image_ids - label_ids)} images have no matching label")
+            if label_ids - image_ids:
+                errors.append(f"{len(label_ids - image_ids)} labels have no matching image")
+ 
+        if errors:
+            error_list = "\n  - ".join(errors)
+            raise ValueError(f"Dataset validation failed with {len(errors)} error(s):\n  - {error_list}")
+ 
+        print(f"✓ Dataset validation passed")
+        print(f"  Format: {file_ending}")
+        print(f"  {len(image_files)} images, {len(label_files)} labels")
+        return True
+ 
+    # ------------------------------------------------------------------
+    # Step 6: Plan and preprocess
+    # ------------------------------------------------------------------
+    def plan_and_preprocess(self, verify_integrity=True):
+        """
+        Run nnU-Net's dataset fingerprinting, experiment planning, and preprocessing.
+ 
+        Surfaces the generated plan (patch sizes, batch size, available configurations)
+        to the user after completion.
+ 
+        Parameters
+        ----------
+        verify_integrity : bool
+            If True, runs nnU-Net's built-in dataset integrity check.
+ 
+        Returns
+        -------
+        dict — parsed plans.json, or empty dict if plans file not found
+        """
+        import os
+        import json
+        import subprocess
+ 
+        for var in ["nnUNet_raw", "nnUNet_preprocessed"]:
+            if os.environ.get(var) is None:
+                raise EnvironmentError(f"{var} is not set. Call setup_environment() first.")
+ 
+        print(f"\n{'='*60}")
+        print(f"  Planning and preprocessing Dataset {self.dataset_id}")
+        print(f"{'='*60}")
+ 
+        cmd = ["nnUNetv2_plan_and_preprocess", "-d", str(self.dataset_id)]
+        if verify_integrity:
+            cmd.append("--verify_dataset_integrity")
+ 
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"STDOUT:\n{result.stdout}")
+            print(f"STDERR:\n{result.stderr}")
+            raise RuntimeError(f"nnUNetv2_plan_and_preprocess failed (exit code {result.returncode})")
+ 
+        print("✓ Planning and preprocessing complete")
+ 
+        plans_path = os.path.join(
+            os.environ["nnUNet_preprocessed"], self.dataset_name, "nnUNetPlans.json"
+        )
+        if os.path.isfile(plans_path):
+            with open(plans_path) as f:
+                plans = json.load(f)
+            configs = list(plans.get("configurations", {}).keys())
+            print(f"\n  Available configurations: {configs}")
+            if self.configuration in plans.get("configurations", {}):
+                config = plans["configurations"][self.configuration]
+                print(f"  Selected: {self.configuration}")
+                print(f"    Patch size: {config.get('patch_size', 'N/A')}")
+                print(f"    Batch size: {config.get('batch_size', 'N/A')}")
+            return plans
+ 
+        print("  ⚠ Could not find plans.json to display summary")
+        return {}
+ 
+    # ------------------------------------------------------------------
+    # Step 8: Find best configuration (post-training)
+    # ------------------------------------------------------------------
+    def find_best_configuration(self):
+        """
+        Run nnU-Net's automatic configuration comparison after training.
+        Should be called after training all desired configurations.
+ 
+        Returns
+        -------
+        str — stdout from nnUNetv2_find_best_configuration
+        """
+        import subprocess
+ 
+        print(f"\n{'='*60}")
+        print(f"  Finding best configuration for Dataset {self.dataset_id}")
+        print(f"{'='*60}")
+ 
+        cmd = ["nnUNetv2_find_best_configuration", str(self.dataset_id)]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"STDERR:\n{result.stderr}")
+            raise RuntimeError(f"nnUNetv2_find_best_configuration failed (exit code {result.returncode})")
+ 
+        print(result.stdout)
+        return result.stdout
+ 
+    def fit(self, X_train=None, y_train=None, fold=0, save_softmax=False):
+        """
+        Train nnU-Net model.
+ 
+        If X_train and y_train are provided, runs the full pipeline:
+            1) prepare_dataset()       → nnUNet_raw/<dataset>/
+            2) validate_dataset()      → check structure
+            3) plan_and_preprocess()   → nnUNet_preprocessed/
+            4) train                   → nnUNet_results/
+ 
+        If they are None, assumes data is already prepared and preprocessed,
+        and only runs the training step.
+ 
+        Parameters
+        ----------
+        X_train : np.ndarray or None — training images
+        y_train : np.ndarray or None — training masks
+        fold : int or str — 0-4 for single fold, "all" for all 5
+        save_softmax : bool — if True, passes --npz for ensembling
+ 
+        Returns self.
+        """
+        import os
+        import subprocess
+ 
+        if X_train is not None and y_train is not None:
+            self.setup_environment()
+            self.prepare_dataset(X_train, y_train)
+            self.validate_dataset()
+            self.plan_and_preprocess()
+ 
+        nnunet_results = os.environ.get("nnUNet_results")
+        if nnunet_results is None:
+            raise EnvironmentError("nnUNet_results is not set. Call setup_environment() first.")
+ 
+        folds_to_train = [0, 1, 2, 3, 4] if fold == "all" else [int(fold)]
+ 
+        for f in folds_to_train:
+            print(f"\n{'='*60}")
+            print(f"  Training fold {f}")
+            print(f"{'='*60}")
+ 
+            cmd = ["nnUNetv2_train", str(self.dataset_id), self.configuration, str(f)]
+            if save_softmax:
+                cmd.append("--npz")
+ 
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"STDOUT:\n{result.stdout}")
+                print(f"STDERR:\n{result.stderr}")
+                raise RuntimeError(f"nnUNetv2_train failed on fold {f} (exit code {result.returncode})")
+            print(f"✓ Fold {f} complete")
+ 
+        self.model_folder = os.path.join(
+            nnunet_results, self.dataset_name,
+            f"nnUNetTrainer__nnUNetPlans__{self.configuration}",
+        )
+        self.folds = tuple(folds_to_train)
+        self._load_predictor()
+ 
+        print(f"\n✓ Training complete — {len(folds_to_train)} fold(s)")
+        return self
+ 
+    # ------------------------------------------------------------------
+    # Step 9: Inference
+    # ------------------------------------------------------------------
     def _load_predictor(self):
         """
         Build self._predictor = nnUNetPredictor(...) and call
-        initialize_from_trained_model_folder(self.model_folder, self.folds, self.checkpoint_name).
+        initialize_from_trained_model_folder.
         """
         import os
+
+        self._check_environment()
  
         if not os.path.isdir(self.model_folder):
             raise FileNotFoundError(
@@ -309,128 +757,6 @@ class NnUNetSegModel(SegModel):
         )
         print(f"✓ nnU-Net loaded from {self.model_folder}")
         print(f"  Folds: {self.folds} | Checkpoint: {self.checkpoint_name}")
-
-    def _arrays_to_nnunet_layout(self, images, masks, out_dir):
-        """
-        Write (N, 320, 320, 1) arrays as NIfTI into nnU-Net's imagesTr/labelsTr layout
-        and emit dataset.json. Returns the created dataset directory path.
-        """
-        import os
-        import json
- 
-        try:
-            import nibabel as nib
-        except ImportError:
-            raise ImportError(
-                "nibabel is required for NIfTI conversion.\n"
-                "Install with: pip install nibabel"
-            )
- 
-        dataset_dir = os.path.join(out_dir, self.dataset_name)
-        images_dir = os.path.join(dataset_dir, "imagesTr")
-        labels_dir = os.path.join(dataset_dir, "labelsTr")
-        os.makedirs(images_dir, exist_ok=True)
-        os.makedirs(labels_dir, exist_ok=True)
- 
-        affine = np.eye(4)
-        train_list = []
- 
-        for i in range(len(images)):
-            case_id = f"case_{i:04d}"
-            train_list.append(case_id)
- 
-            img_2d = images[i].squeeze().astype(np.float32)
-            mask_2d = masks[i].squeeze().astype(np.uint8)
- 
-            img_nifti = nib.Nifti1Image(img_2d[..., np.newaxis], affine)
-            mask_nifti = nib.Nifti1Image(mask_2d[..., np.newaxis], affine)
- 
-            nib.save(img_nifti, os.path.join(images_dir, f"{case_id}_0000.nii.gz"))
-            nib.save(mask_nifti, os.path.join(labels_dir, f"{case_id}.nii.gz"))
- 
-        dataset_json = {
-            "channel_names": {"0": "ultrasound"},
-            "labels": {"background": 0, "foreground": 1},
-            "numTraining": len(images),
-            "file_ending": ".nii.gz",
-            "name": self.dataset_name,
-            "description": "Cardiac ultrasound segmentation",
-        }
- 
-        with open(os.path.join(dataset_dir, "dataset.json"), "w") as f:
-            json.dump(dataset_json, f, indent=2)
- 
-        print(f"✓ Wrote {len(images)} cases to {dataset_dir}")
-        return dataset_dir
- 
-    def fit(self, X_train, y_train, fold=0, dataset_id=101):
-        """
-        Full training pipeline:
-            1) _arrays_to_nnunet_layout(...)     → nnUNet_raw/<dataset>/
-            2) nnUNetv2_plan_and_preprocess      → nnUNet_preprocessed/
-            3) nnUNetv2_train <id> 2d <fold>     → nnUNet_results/
- 
-        Updates self.model_folder and calls _load_predictor(). Returns self.
-        """
-        import os
-        import subprocess
- 
-        nnunet_raw = os.environ.get("nnUNet_raw", "nnUNet_raw")
-        nnunet_results = os.environ.get("nnUNet_results", "nnUNet_results")
- 
-        # Step 1: convert numpy arrays to nnU-Net folder layout
-        print(f"\n{'='*60}")
-        print(f"  Step 1/3: Converting arrays to nnU-Net layout")
-        print(f"{'='*60}")
-        self._arrays_to_nnunet_layout(X_train, y_train, nnunet_raw)
- 
-        # Step 2: plan and preprocess
-        print(f"\n{'='*60}")
-        print(f"  Step 2/3: Planning and preprocessing")
-        print(f"{'='*60}")
-        cmd_preprocess = [
-            "nnUNetv2_plan_and_preprocess",
-            "-d", str(dataset_id),
-            "--verify_dataset_integrity",
-        ]
-        result = subprocess.run(cmd_preprocess, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"STDOUT:\n{result.stdout}")
-            print(f"STDERR:\n{result.stderr}")
-            raise RuntimeError(
-                f"nnUNetv2_plan_and_preprocess failed (exit code {result.returncode})"
-            )
-        print("✓ Preprocessing complete")
- 
-        # Step 3: train
-        print(f"\n{'='*60}")
-        print(f"  Step 3/3: Training fold {fold}")
-        print(f"{'='*60}")
-        cmd_train = [
-            "nnUNetv2_train",
-            str(dataset_id),
-            self.configuration,
-            str(fold),
-        ]
-        result = subprocess.run(cmd_train, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"STDOUT:\n{result.stdout}")
-            print(f"STDERR:\n{result.stderr}")
-            raise RuntimeError(
-                f"nnUNetv2_train failed (exit code {result.returncode})"
-            )
-        print(f"✓ Training complete for fold {fold}")
- 
-        # Update model_folder to point to the trained results
-        self.model_folder = os.path.join(
-            nnunet_results,
-            self.dataset_name,
-            f"nnUNetTrainer__nnUNetPlans__{self.configuration}",
-        )
-        self.folds = (fold,)
-        self._load_predictor()
- 
-        return self
  
     def predict(self, images, threshold=None):
         """
@@ -439,6 +765,9 @@ class NnUNetSegModel(SegModel):
  
         Raises RuntimeError if self._predictor is None.
         """
+
+        self._check_environment()
+
         if self._predictor is None:
             raise RuntimeError(
                 "No trained model loaded. Either:\n"
@@ -450,7 +779,11 @@ class NnUNetSegModel(SegModel):
             threshold = self.threshold
  
         results = []
-        for i in range(len(images)):
+        n = len(images)
+        for i in range(n):
+            if n > 5 and (i + 1) % 5 == 0:
+                print(f"  Predicting {i + 1}/{n}...", end="\r")
+ 
             img = images[i].squeeze()           # (H, W)
             img_nnunet = img[np.newaxis, ...]    # (1, H, W) — channel-first
  
@@ -469,29 +802,28 @@ class NnUNetSegModel(SegModel):
  
             results.append(seg_probs[..., np.newaxis])  # (H, W, 1)
  
+        if n > 5:
+            print(f"  Predicting {n}/{n}... done")
+ 
         preds = np.array(results, dtype=np.float32)
         return (preds > threshold).astype(np.uint8)
  
     def evaluate(self, X_test, y_test):
         """
         Call self.predict(X_test), then compute dice/iou against y_test with numpy.
-        Returns dict: {"dice": ..., "iou": ...}.
+        Returns dict: {"dice": ..., "iou": ..., "precision": ..., "recall": ...}.
         """
         preds = self.predict(X_test)
  
-        # Flatten for metric computation
         y_true = y_test.flatten().astype(np.float32)
         y_pred = preds.flatten().astype(np.float32)
  
-        # Dice
         intersection = np.sum(y_true * y_pred)
         dice = (2.0 * intersection + SMOOTH) / (np.sum(y_true) + np.sum(y_pred) + SMOOTH)
  
-        # IoU
         union = np.sum(y_true) + np.sum(y_pred) - intersection
         iou = (intersection + SMOOTH) / (union + SMOOTH)
  
-        # Precision and recall
         tp = np.sum(y_true * y_pred)
         precision = (tp + SMOOTH) / (np.sum(y_pred) + SMOOTH)
         recall = (tp + SMOOTH) / (np.sum(y_true) + SMOOTH)
@@ -508,4 +840,3 @@ class NnUNetSegModel(SegModel):
             print(f"  {k:>12s}: {v:.4f}")
  
         return results
- 
