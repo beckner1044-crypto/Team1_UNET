@@ -820,35 +820,35 @@ class NnUNetSegModel(SegModel):
             save_softmax=False, continue_training=False):
         import os
         import subprocess
-
+ 
         if X_train is not None and y_train is not None:
             self.setup_environment()
             self.prepare_dataset(X_train, y_train)
             self.validate_dataset()
             self.plan_and_preprocess()
-
+ 
         nnunet_results = os.environ.get("nnUNet_results")
         if nnunet_results is None:
             raise EnvironmentError("nnUNet_results is not set. Call setup_environment() first.")
-
+ 
         if folds == "all_cv":
             folds_to_train = [0, 1, 2, 3, 4]
         else:
             folds_to_train = [int(folds)]
-
+ 
         for f in folds_to_train:
             print(f"\n{'='*60}")
             print(f"  Training fold {f}")
             print(f"{'='*60}")
-
+ 
             cmd = ["nnUNetv2_train", str(self.dataset_id), self.configuration, str(f)]
-
+ 
             if save_softmax:
                 cmd.append("--npz")
-
+ 
             if continue_training:
                 cmd.append("--c")
-
+ 
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 print(f"STDOUT:\n{result.stdout}")
@@ -856,9 +856,9 @@ class NnUNetSegModel(SegModel):
                 raise RuntimeError(
                     f"nnUNetv2_train failed on fold {f} (exit code {result.returncode})"
                 )
-
+ 
             print(f"✓ Fold {f} complete")
-
+ 
         self.model_folder = os.path.join(
             nnunet_results,
             self.dataset_name,
@@ -866,138 +866,147 @@ class NnUNetSegModel(SegModel):
         )
         self.folds = tuple(folds_to_train)
         self._load_predictor()
-
+ 
         print(f"\n✓ Training complete — {len(folds_to_train)} fold(s)")
         return self
-
-        # ------------------------------------------------------------------
-        # Step 9: Inference
-        # ------------------------------------------------------------------
-        def _load_predictor(self):
-            """
-            Build self._predictor = nnUNetPredictor(...) and call
-            initialize_from_trained_model_folder.
-            """
-            import os
-
-            self._check_environment()
-
-            if not os.path.isdir(self.model_folder):
-                raise FileNotFoundError(
-                    f"Model folder not found: {self.model_folder}\n"
-                    f"Expected a directory containing plans.json, dataset.json, "
-                    f"and fold_X/ subdirectories."
-                )
-
-            try:
-                from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
-            except ImportError:
-                raise ImportError(
-                    "nnU-Net v2 is not installed.\n"
-                    "Install with: pip install nnunetv2"
-                )
-
-            import torch
-            device = self.device
-            if device == "cuda" and not torch.cuda.is_available():
-                print("  ⚠ CUDA not available, falling back to CPU")
-                device = "cpu"
-
-            self._predictor = nnUNetPredictor(
-                tile_step_size=0.5,
-                use_mirroring=True,
-                perform_everything_on_device=True,
-                device=torch.device(device),
-                verbose=False,
-                verbose_preprocessing=False,
+ 
+    def resume_training(self, folds="all_cv", save_softmax=False):
+        """Resume a previously interrupted training run."""
+        return self.fit(
+            X_train=None,
+            y_train=None,
+            folds=folds,
+            save_softmax=save_softmax,
+            continue_training=True,
+        )
+ 
+    # ------------------------------------------------------------------
+    # Step 9: Inference
+    # ------------------------------------------------------------------
+    def _load_predictor(self):
+        """
+        Build self._predictor = nnUNetPredictor(...) and call
+        initialize_from_trained_model_folder.
+        """
+        import os
+ 
+        self._check_environment()
+ 
+        if not os.path.isdir(self.model_folder):
+            raise FileNotFoundError(
+                f"Model folder not found: {self.model_folder}\n"
+                f"Expected a directory containing plans.json, dataset.json, "
+                f"and fold_X/ subdirectories."
             )
-            self._predictor.initialize_from_trained_model_folder(
-                self.model_folder,
-                use_folds=self.folds,
-                checkpoint_name=self.checkpoint_name,
+ 
+        try:
+            from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+        except ImportError:
+            raise ImportError(
+                "nnU-Net v2 is not installed.\n"
+                "Install with: pip install nnunetv2"
             )
-            print(f"✓ nnU-Net loaded from {self.model_folder}")
-            print(f"  Folds: {self.folds} | Checkpoint: {self.checkpoint_name}")
-
-        def predict(self, images, threshold=None):
-            """
-            Per-image inference via self._predictor.predict_single_npy_array,
-            then stack and binarize.
-
-            Raises RuntimeError if self._predictor is None.
-            """
-
-            self._check_environment()
-
-            if self._predictor is None:
-                raise RuntimeError(
-                    "No trained model loaded. Either:\n"
-                    "  - Use NnUNetSegModel.from_checkpoint(model_folder=...) to load trained weights\n"
-                    "  - Call .fit(X_train, y_train) to train first"
-                )
-
-            if threshold is None:
-                threshold = self.threshold
-
-            results = []
-            n = len(images)
-            for i in range(n):
-                if n > 5 and (i + 1) % 5 == 0:
-                    print(f"  Predicting {i + 1}/{n}...", end="\r")
-
-                img = images[i].squeeze()           # (H, W)
-                img_nnunet = img[np.newaxis, ...]    # (1, H, W) — channel-first
-
-                props = {"spacing": [999, 1, 1]}
-
-                predicted = self._predictor.predict_single_npy_array(
-                    img_nnunet, props, None, None,
-                    save_or_return_probabilities=True,
-                )
-
-                if isinstance(predicted, tuple):
-                    prob_map = predicted[1]
-                    seg_probs = prob_map[1] if prob_map.shape[0] > 1 else prob_map[0]
-                else:
-                    seg_probs = predicted.astype(np.float32)
-
-                results.append(seg_probs[..., np.newaxis])  # (H, W, 1)
-
-            if n > 5:
-                print(f"  Predicting {n}/{n}... done")
-
-            preds = np.array(results, dtype=np.float32)
-            return (preds > threshold).astype(np.uint8)
-
+ 
+        import torch
+        device = self.device
+        if device == "cuda" and not torch.cuda.is_available():
+            print("  ⚠ CUDA not available, falling back to CPU")
+            device = "cpu"
+ 
+        self._predictor = nnUNetPredictor(
+            tile_step_size=0.5,
+            use_mirroring=True,
+            perform_everything_on_device=True,
+            device=torch.device(device),
+            verbose=False,
+            verbose_preprocessing=False,
+        )
+        self._predictor.initialize_from_trained_model_folder(
+            self.model_folder,
+            use_folds=self.folds,
+            checkpoint_name=self.checkpoint_name,
+        )
+        print(f"✓ nnU-Net loaded from {self.model_folder}")
+        print(f"  Folds: {self.folds} | Checkpoint: {self.checkpoint_name}")
+ 
+    def predict(self, images, threshold=None):
+        """
+        Per-image inference via self._predictor.predict_single_npy_array,
+        then stack and binarize.
+ 
+        Raises RuntimeError if self._predictor is None.
+        """
+        self._check_environment()
+ 
+        if self._predictor is None:
+            raise RuntimeError(
+                "No trained model loaded. Either:\n"
+                "  - Use NnUNetSegModel.from_checkpoint(model_folder=...) to load trained weights\n"
+                "  - Call .fit(X_train, y_train) to train first"
+            )
+ 
+        if threshold is None:
+            threshold = self.threshold
+ 
+        results = []
+        n = len(images)
+        for i in range(n):
+            if n > 5 and (i + 1) % 5 == 0:
+                print(f"  Predicting {i + 1}/{n}...", end="\r")
+ 
+            img = images[i].squeeze()           # (H, W)
+            img_nnunet = img[np.newaxis, ...]    # (1, H, W) — channel-first
+ 
+            props = {"spacing": [999, 1, 1]}
+ 
+            predicted = self._predictor.predict_single_npy_array(
+                img_nnunet, props, None, None,
+                save_or_return_probabilities=True,
+            )
+ 
+            if isinstance(predicted, tuple):
+                prob_map = predicted[1]
+                seg_probs = prob_map[1] if prob_map.shape[0] > 1 else prob_map[0]
+            else:
+                seg_probs = predicted.astype(np.float32)
+ 
+            results.append(seg_probs[..., np.newaxis])  # (H, W, 1)
+ 
+        if n > 5:
+            print(f"  Predicting {n}/{n}... done")
+ 
+        preds = np.array(results, dtype=np.float32)
+        return (preds > threshold).astype(np.uint8)
+ 
     def evaluate(self, X_test, y_test):
         """
         Call self.predict(X_test), then compute dice/iou against y_test with numpy.
         Returns dict: {"dice": ..., "iou": ..., "precision": ..., "recall": ...}.
         """
         preds = self.predict(X_test)
-
+ 
         y_true = y_test.flatten().astype(np.float32)
         y_pred = preds.flatten().astype(np.float32)
-
+ 
         intersection = np.sum(y_true * y_pred)
         dice = (2.0 * intersection + SMOOTH) / (np.sum(y_true) + np.sum(y_pred) + SMOOTH)
-
+ 
         union = np.sum(y_true) + np.sum(y_pred) - intersection
         iou = (intersection + SMOOTH) / (union + SMOOTH)
-
+ 
         tp = np.sum(y_true * y_pred)
         precision = (tp + SMOOTH) / (np.sum(y_pred) + SMOOTH)
         recall = (tp + SMOOTH) / (np.sum(y_true) + SMOOTH)
-
+ 
         results = {
             "dice": float(dice),
             "iou": float(iou),
             "precision": float(precision),
             "recall": float(recall),
         }
-
+ 
         print("\n--- Evaluation Results ---")
         for k, v in results.items():
             print(f"  {k:>12s}: {v:.4f}")
-
+ 
         return results
