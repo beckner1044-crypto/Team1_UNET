@@ -1,8 +1,8 @@
 """
-unet_api.py — INIA segmentation API (skeleton).
+unet_api.py — INIA segmentation API.
 
 Superclass defines the common contract; subclasses fill in Keras-specific and
-nnU-Net-specific behavior. Team members can pick up individual methods to implement.
+nnU-Net-specific behavior.
 
 Data assumptions (cardiac ultrasound, Dataset101_CardiacUS):
     Raw:
@@ -44,6 +44,8 @@ Usage:
 from abc import ABC, abstractmethod
 import os
 import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 
 
 # =============================================================================
@@ -77,7 +79,22 @@ def load_data(images_path="images.npz", masks_path="masks.npz",
     -------
     X_train, y_train, X_test, y_test : np.ndarray of shape (*, 320, 320, 1) float32
     """
-    ...
+    images = np.load(images_path)["images"]   # (N, 300, 300, 3) uint8
+    masks  = np.load(masks_path)["masks"]     # (N, 300, 300)    uint8
+
+    # Shuffle with fixed seed before split
+    rng     = np.random.default_rng(seed)
+    indices = rng.permutation(len(images))
+    images  = images[indices]
+    masks   = masks[indices]
+
+    images, masks = preprocess(images, masks)
+
+    X_test,  y_test  = images[:test_split],  masks[:test_split]
+    X_train, y_train = images[test_split:],  masks[test_split:]
+
+    print(f"[load_data] Train: {X_train.shape} | Test: {X_test.shape}")
+    return X_train, y_train, X_test, y_test
 
 
 def preprocess(images, masks):
@@ -96,7 +113,31 @@ def preprocess(images, masks):
     -------
     images, masks : np.ndarray, both (N, 320, 320, 1) float32
     """
-    ...
+    # 1. Crop top 24 rows  (300 → 276 tall)
+    images = images[:, 24:, :, :]   # (N, 276, 300, C)
+    masks  = masks[:, 24:, :]       # (N, 276, 300)
+
+    # 2. Take only channel 0
+    images = images[..., 0]         # (N, 276, 300)
+
+    # 3. Normalize images to [0, 1]
+    images = images.astype(np.float32) / 255.0
+
+    # 4. Binarize masks
+    masks = (masks > 0).astype(np.float32)
+
+    # 5. Pad height and width to 320×320
+    #    276 → 320 : 22 top, 22 bottom
+    #    300 → 320 : 10 left, 10 right
+    images = np.pad(images, ((0,0),(22,22),(10,10)), mode="constant", constant_values=0.0)
+    masks  = np.pad(masks,  ((0,0),(22,22),(10,10)), mode="constant", constant_values=0.0)
+
+    # 6. Add trailing channel axis → (N, 320, 320, 1)
+    images = images[..., np.newaxis]
+    masks  = masks[..., np.newaxis]
+
+    return images, masks
+
 
 def normalize_images(images):
     """
@@ -223,100 +264,98 @@ class SegModel(ABC):
     # ------------------------------------------------------------------
     # Shared — subclasses inherit as-is
     # ------------------------------------------------------------------
-def plot_predictions(self, X_test, y_test, n=3):
-    import numpy as np
-    import matplotlib.pyplot as plt
-    """
-    Visualize n random samples: input | ground truth | predicted mask | overlay.
+    def plot_predictions(self, X_test, y_test, n=3):
+        """
+        Visualize n random samples: input | ground truth | predicted mask | overlay.
 
-    X_test : (M, 320, 320, 1) float32
-    y_test : (M, 320, 320, 1) float32 {0, 1}
-    n      : number of random samples to plot
-    """
-    n = min(n, len(X_test))
-    idxs = np.random.choice(len(X_test), size=n, replace=False)
+        X_test : (M, 320, 320, 1) float32
+        y_test : (M, 320, 320, 1) float32 {0, 1}
+        n      : number of random samples to plot
+        """
+        n = min(n, len(X_test))
+        idxs = np.random.choice(len(X_test), size=n, replace=False)
 
-    fig, axes = plt.subplots(n, 4, figsize=(16, 4 * n))
+        fig, axes = plt.subplots(n, 4, figsize=(16, 4 * n))
 
-    if n == 1:
-        axes = np.expand_dims(axes, axis=0)
+        if n == 1:
+            axes = np.expand_dims(axes, axis=0)
 
-    for i, idx in enumerate(idxs):
-        img = X_test[idx]
-        true_mask = y_test[idx]
+        # Use predict() so this works for any subclass (Keras or nnUNet)
+        pred_batch = self.predict(X_test[idxs])
 
-        pred_mask = self.model.predict(img[np.newaxis, ...], verbose=0)[0]
-        pred_mask = (pred_mask > 0.5).astype(np.uint8)
+        for i, idx in enumerate(idxs):
+            img = X_test[idx].squeeze()
+            true_mask = y_test[idx].squeeze()
+            pred_mask = pred_batch[i].squeeze()
 
-        img = img.squeeze()
-        true_mask = true_mask.squeeze()
-        pred_mask = pred_mask.squeeze()
+            axes[i, 0].imshow(img, cmap="gray")
+            axes[i, 0].set_title("Input")
+            axes[i, 0].axis("off")
 
-        axes[i, 0].imshow(img, cmap="gray")
-        axes[i, 0].set_title("Input")
-        axes[i, 0].axis("off")
+            axes[i, 1].imshow(true_mask, cmap="gray")
+            axes[i, 1].set_title("Ground truth")
+            axes[i, 1].axis("off")
 
-        axes[i, 1].imshow(true_mask, cmap="gray")
-        axes[i, 1].set_title("Ground truth")
-        axes[i, 1].axis("off")
+            axes[i, 2].imshow(pred_mask, cmap="gray")
+            axes[i, 2].set_title("Predicted")
+            axes[i, 2].axis("off")
 
-        axes[i, 2].imshow(pred_mask, cmap="gray")
-        axes[i, 2].set_title("Predicted")
-        axes[i, 2].axis("off")
+            axes[i, 3].imshow(img, cmap="gray")
+            axes[i, 3].imshow(np.ma.masked_where(pred_mask == 0, pred_mask),
+                              cmap="autumn", alpha=0.45)
+            axes[i, 3].set_title("Overlay")
+            axes[i, 3].axis("off")
 
-        axes[i, 3].imshow(img, cmap="gray")
-        axes[i, 3].imshow(np.ma.masked_where(pred_mask == 0, pred_mask),
-                          cmap="autumn", alpha=0.45)
-        axes[i, 3].set_title("Overlay")
-        axes[i, 3].axis("off")
+        plt.tight_layout()
+        plt.show()
 
-    plt.tight_layout()
-    plt.show()
+    def plot_history(self):
+        """Plot training curves from self.history (Dice/IoU, loss, precision/recall).
 
-def plot_history(self):
-    """Plot training curves from self.history (Dice/IoU, loss, precision/recall)."""
-    if self.history is None:
-        raise ValueError("self.history is None. Train the model first and save the History object.")
+        NOTE: When training should have something like: self.history = self.model.fit(...)
+        NOTE: Sometimes keras saves metric names differently than expected. If a column
+              is missing, run: print(self.history.history.keys()) to see the actual names.
+        """
+        if self.history is None:
+            raise ValueError("self.history is None. Train the model first and save the History object.")
 
-    hist_df = pd.DataFrame(self.history.history)
+        hist_df = pd.DataFrame(self.history.history)
 
-    fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
+        fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
 
-    seg_cols = ['dice_coef', 'val_dice_coef', 'iou_coef', 'val_iou_coef']
-    train_cols = ['loss', 'val_loss', 'bin_acc', 'val_bin_acc']
-    pr_cols = ['precision', 'recall', 'val_precision', 'val_recall']
+        seg_cols = ['dice_coef', 'val_dice_coef', 'iou_coef', 'val_iou_coef']
+        train_cols = ['loss', 'val_loss', 'bin_acc', 'val_bin_acc']
+        pr_cols = ['precision', 'recall', 'val_precision', 'val_recall']
 
-    for cols in [seg_cols, train_cols, pr_cols]:
-        missing = [col for col in cols if col not in hist_df.columns]
-        if missing:
-            raise ValueError(f"Missing columns in self.history.history: {missing}")
+        for cols in [seg_cols, train_cols, pr_cols]:
+            missing = [col for col in cols if col not in hist_df.columns]
+            if missing:
+                raise ValueError(f"Missing columns in self.history.history: {missing}")
 
-    hist_df[seg_cols].plot(ax=axes[0], linewidth=2)
-    axes[0].set_title("Segmentation quality: Dice and IoU")
-    axes[0].set_ylabel("Score")
-    axes[0].set_ylim(0, 1.0)
-    axes[0].grid(True)
-    axes[0].legend(['Train Dice', 'Val Dice', 'Train IoU', 'Val IoU'])
+        hist_df[seg_cols].plot(ax=axes[0], linewidth=2)
+        axes[0].set_title("Segmentation quality: Dice and IoU")
+        axes[0].set_ylabel("Score")
+        axes[0].set_ylim(0, 1.0)
+        axes[0].grid(True)
+        axes[0].legend(['Train Dice', 'Val Dice', 'Train IoU', 'Val IoU'])
 
-    hist_df[train_cols].plot(ax=axes[1], linewidth=2)
-    axes[1].set_title("Training")
-    axes[1].set_ylabel("Loss / Accuracy")
-    axes[1].set_ylim(0, 1.0)
-    axes[1].grid(True)
-    axes[1].legend(['Train Loss', 'Val Loss', 'Bin Acc', 'Val Bin Acc'])
+        hist_df[train_cols].plot(ax=axes[1], linewidth=2)
+        axes[1].set_title("Training")
+        axes[1].set_ylabel("Loss / Accuracy")
+        axes[1].set_ylim(0, 1.0)
+        axes[1].grid(True)
+        axes[1].legend(['Train Loss', 'Val Loss', 'Bin Acc', 'Val Bin Acc'])
 
-    hist_df[pr_cols].plot(ax=axes[2], linewidth=2)
-    axes[2].set_title("Precision and Recall")
-    axes[2].set_xlabel("Epoch")
-    axes[2].set_ylabel("Score")
-    axes[2].set_ylim(0, 1.0)
-    axes[2].grid(True)
-    axes[2].legend(['Train Precision', 'Train Recall', 'Val Precision', 'Val Recall'])
+        hist_df[pr_cols].plot(ax=axes[2], linewidth=2)
+        axes[2].set_title("Precision and Recall")
+        axes[2].set_xlabel("Epoch")
+        axes[2].set_ylabel("Score")
+        axes[2].set_ylim(0, 1.0)
+        axes[2].grid(True)
+        axes[2].legend(['Train Precision', 'Train Recall', 'Val Precision', 'Val Recall'])
 
-    plt.tight_layout()
-    plt.show()
-    # NOTE: When training should have something like: self.history = self.model.fit(...)
-    # NOTE: Sometimes keras would save the name in the dictionary differently than how they are set up in this fuctions, if something doesn't correspond try running: print(self.history.history.keys()) to make sure the name in the dictionary matches what this function expects to have.
+        plt.tight_layout()
+        plt.show()
 
     def __repr__(self):
         return f"{self.__class__.__name__}(model_name='{self.model_name}', threshold={self.threshold})"
@@ -329,8 +368,59 @@ class KerasSegModel(SegModel):
     """Wraps keras_unet_collection models (UNet, UNet++, UNet3++)."""
 
     def __init__(self, model_name, threshold=0.5):
+        if model_name not in SUPPORTED_KERAS_MODELS:
+            raise ValueError(
+                f"Unknown architecture '{model_name}'. "
+                f"Choose from {SUPPORTED_KERAS_MODELS}."
+            )
         super().__init__(model_name, threshold)
-        self.model = self._build_model(model_name)    # untrained tf.keras.Model
+        self.model = self._build_model(model_name)   # untrained tf.keras.Model
+
+    # ------------------------------------------------------------------
+    # Loss / metric factories (static so from_checkpoint can reuse them)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _dice_coef(y_true, y_pred):
+        import tensorflow as tf
+        y_true_f = tf.keras.backend.flatten(tf.cast(y_true, tf.float32))
+        y_pred_f = tf.keras.backend.flatten(y_pred)
+        intersection = tf.keras.backend.sum(y_true_f * y_pred_f)
+        return (2.0 * intersection + SMOOTH) / (
+            tf.keras.backend.sum(y_true_f) + tf.keras.backend.sum(y_pred_f) + SMOOTH
+        )
+
+    @staticmethod
+    def _iou_coef(y_true, y_pred):
+        import tensorflow as tf
+        y_true_f = tf.keras.backend.flatten(tf.cast(y_true, tf.float32))
+        y_pred_f = tf.keras.backend.flatten(y_pred)
+        intersection = tf.keras.backend.sum(y_true_f * y_pred_f)
+        union = (
+            tf.keras.backend.sum(y_true_f)
+            + tf.keras.backend.sum(y_pred_f)
+            - intersection
+        )
+        return (intersection + SMOOTH) / (union + SMOOTH)
+
+    @staticmethod
+    def _bce_dice_loss(y_true, y_pred):
+        import tensorflow as tf
+        y_true_f = tf.keras.backend.flatten(tf.cast(y_true, tf.float32))
+        y_pred_f = tf.keras.backend.flatten(y_pred)
+        intersection = tf.keras.backend.sum(y_true_f * y_pred_f)
+        dice_loss = 1.0 - (2.0 * intersection + SMOOTH) / (
+            tf.keras.backend.sum(y_true_f) + tf.keras.backend.sum(y_pred_f) + SMOOTH
+        )
+        bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
+        return bce + dice_loss
+
+    @classmethod
+    def _custom_objects(cls):
+        return {
+            "bce_dice_loss": cls._bce_dice_loss,
+            "dice_coef":     cls._dice_coef,
+            "iou_coef":      cls._iou_coef,
+        }
 
     @classmethod
     def from_checkpoint(cls, checkpoint_path, threshold=0.5):
@@ -338,7 +428,15 @@ class KerasSegModel(SegModel):
         Load a trained .keras/.h5 file via tf.keras.models.load_model.
         Uses custom_objects for dice_coef / iou_coef / bce_dice_loss.
         """
-        ...
+        import tensorflow as tf
+        instance = cls.__new__(cls)
+        super(KerasSegModel, instance).__init__(checkpoint_path, threshold)
+        instance.model = tf.keras.models.load_model(
+            checkpoint_path,
+            custom_objects=cls._custom_objects(),
+        )
+        instance.history = None
+        return instance
 
     def _build_model(self, name):
         """
@@ -348,27 +446,32 @@ class KerasSegModel(SegModel):
             "unet3++"  → unet_3plus_2d
         All built with INPUT_SIZE, FILTER_NUM, n_labels=1, Sigmoid output.
         """
-        self.models = [
-            "unet_2d" = models.unet_2d(
-                input_size=(320, 320, 1),
-                filter_num=[64, 128, 256, 512],
+        from keras_unet_collection import models as kuc
+
+        if name == "unet":
+            return kuc.unet_2d(
+                input_size=INPUT_SIZE,
+                filter_num=FILTER_NUM,
                 n_labels=1,
-                output_activation="Sigmoid"
+                output_activation="Sigmoid",
+                name="unet",
             )
-            "unet_plus_2d" = models.unet_plus_2d(
-                input_size=(320, 320, 1),
-                filter_num=[64, 128, 256, 512],
+        elif name == "unet++":
+            return kuc.unet_plus_2d(
+                input_size=INPUT_SIZE,
+                filter_num=FILTER_NUM,
                 n_labels=1,
-                output_activation="Sigmoid"
+                output_activation="Sigmoid",
+                name="unetpp",
             )
-            "unet_3plus_2d" = models.unet_3plus_2d(
-                input_size=(320, 320, 1),
+        elif name == "unet3++":
+            return kuc.unet_3plus_2d(
+                input_size=INPUT_SIZE,
+                filter_num_down=FILTER_NUM,
                 n_labels=1,
-                filter_num_down=[64, 128, 256, 512],
-                output_activation="Sigmoid"
+                output_activation="Sigmoid",
+                name="unet3pp",
             )
-        ]
-        ...
 
     def fit(self, X_train, y_train,
             epochs=50, batch_size=BATCH_SIZE,
@@ -382,15 +485,64 @@ class KerasSegModel(SegModel):
         Default callbacks: EarlyStopping(val_dice_coef, patience=10, restore_best),
                            ModelCheckpoint(f"best_{model_name}.keras").
         """
-        ...
+        import tensorflow as tf
+
+        self.model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+            loss=self._bce_dice_loss,
+            metrics=[
+                tf.keras.metrics.BinaryAccuracy(name="bin_acc"),
+                tf.keras.metrics.Precision(name="precision"),
+                tf.keras.metrics.Recall(name="recall"),
+                self._dice_coef,
+                self._iou_coef,
+            ],
+        )
+
+        ckpt_name = f"best_{self.model_name.replace('++', 'pp').replace('+', 'p')}.keras"
+        if callbacks is None:
+            callbacks = [
+                tf.keras.callbacks.EarlyStopping(
+                    monitor="val_dice_coef", patience=10,
+                    mode="max", restore_best_weights=True, verbose=1,
+                ),
+                tf.keras.callbacks.ModelCheckpoint(
+                    ckpt_name, monitor="val_dice_coef",
+                    save_best_only=True, mode="max", verbose=1,
+                ),
+                tf.keras.callbacks.ReduceLROnPlateau(
+                    monitor="val_loss", factor=0.5, patience=5,
+                    min_lr=1e-7, verbose=1,
+                ),
+            ]
+
+        self.history = self.model.fit(
+            X_train, y_train,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_split=validation_split,
+            callbacks=callbacks,
+            verbose=1,
+        )
+        return self
 
     def predict(self, images, threshold=None):
         """self.model.predict(images) > (threshold or self.threshold), cast to uint8."""
-        ...
+        t = threshold if threshold is not None else self.threshold
+        preds = self.model.predict(images, verbose=0)
+        return (preds > t).astype(np.uint8)
 
     def evaluate(self, X_test, y_test):
         """self.model.evaluate(...) → zip with model.metrics_names → dict."""
-        ...
+        results = self.model.evaluate(X_test, y_test, verbose=0)
+        names = self.model.metrics_names
+        metrics = dict(zip(names, results))
+        # Expose canonical 'dice' and 'iou' keys for cross-framework comparison
+        if "dice_coef" in metrics:
+            metrics["dice"] = metrics["dice_coef"]
+        if "iou_coef" in metrics:
+            metrics["iou"] = metrics["iou_coef"]
+        return metrics
 
 
 # =============================================================================
@@ -820,35 +972,35 @@ class NnUNetSegModel(SegModel):
             save_softmax=False, continue_training=False):
         import os
         import subprocess
- 
+
         if X_train is not None and y_train is not None:
             self.setup_environment()
             self.prepare_dataset(X_train, y_train)
             self.validate_dataset()
             self.plan_and_preprocess()
- 
+
         nnunet_results = os.environ.get("nnUNet_results")
         if nnunet_results is None:
             raise EnvironmentError("nnUNet_results is not set. Call setup_environment() first.")
- 
+
         if folds == "all_cv":
             folds_to_train = [0, 1, 2, 3, 4]
         else:
             folds_to_train = [int(folds)]
- 
+
         for f in folds_to_train:
             print(f"\n{'='*60}")
             print(f"  Training fold {f}")
             print(f"{'='*60}")
- 
+
             cmd = ["nnUNetv2_train", str(self.dataset_id), self.configuration, str(f)]
- 
+
             if save_softmax:
                 cmd.append("--npz")
- 
+
             if continue_training:
                 cmd.append("--c")
- 
+
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 print(f"STDOUT:\n{result.stdout}")
@@ -856,9 +1008,9 @@ class NnUNetSegModel(SegModel):
                 raise RuntimeError(
                     f"nnUNetv2_train failed on fold {f} (exit code {result.returncode})"
                 )
- 
+
             print(f"✓ Fold {f} complete")
- 
+
         self.model_folder = os.path.join(
             nnunet_results,
             self.dataset_name,
@@ -866,10 +1018,10 @@ class NnUNetSegModel(SegModel):
         )
         self.folds = tuple(folds_to_train)
         self._load_predictor()
- 
+
         print(f"\n✓ Training complete — {len(folds_to_train)} fold(s)")
         return self
- 
+
     def resume_training(self, folds="all_cv", save_softmax=False):
         """Resume a previously interrupted training run."""
         return self.fit(
@@ -879,7 +1031,7 @@ class NnUNetSegModel(SegModel):
             save_softmax=save_softmax,
             continue_training=True,
         )
- 
+
     # ------------------------------------------------------------------
     # Step 9: Inference
     # ------------------------------------------------------------------
@@ -889,16 +1041,16 @@ class NnUNetSegModel(SegModel):
         initialize_from_trained_model_folder.
         """
         import os
- 
+
         self._check_environment()
- 
+
         if not os.path.isdir(self.model_folder):
             raise FileNotFoundError(
                 f"Model folder not found: {self.model_folder}\n"
                 f"Expected a directory containing plans.json, dataset.json, "
                 f"and fold_X/ subdirectories."
             )
- 
+
         try:
             from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
         except ImportError:
@@ -906,13 +1058,13 @@ class NnUNetSegModel(SegModel):
                 "nnU-Net v2 is not installed.\n"
                 "Install with: pip install nnunetv2"
             )
- 
+
         import torch
         device = self.device
         if device == "cuda" and not torch.cuda.is_available():
             print("  ⚠ CUDA not available, falling back to CPU")
             device = "cpu"
- 
+
         self._predictor = nnUNetPredictor(
             tile_step_size=0.5,
             use_mirroring=True,
@@ -928,85 +1080,85 @@ class NnUNetSegModel(SegModel):
         )
         print(f"✓ nnU-Net loaded from {self.model_folder}")
         print(f"  Folds: {self.folds} | Checkpoint: {self.checkpoint_name}")
- 
+
     def predict(self, images, threshold=None):
         """
         Per-image inference via self._predictor.predict_single_npy_array,
         then stack and binarize.
- 
+
         Raises RuntimeError if self._predictor is None.
         """
         self._check_environment()
- 
+
         if self._predictor is None:
             raise RuntimeError(
                 "No trained model loaded. Either:\n"
                 "  - Use NnUNetSegModel.from_checkpoint(model_folder=...) to load trained weights\n"
                 "  - Call .fit(X_train, y_train) to train first"
             )
- 
+
         if threshold is None:
             threshold = self.threshold
- 
+
         results = []
         n = len(images)
         for i in range(n):
             if n > 5 and (i + 1) % 5 == 0:
                 print(f"  Predicting {i + 1}/{n}...", end="\r")
- 
+
             img = images[i].squeeze()           # (H, W)
             img_nnunet = img[np.newaxis, ...]    # (1, H, W) — channel-first
- 
+
             props = {"spacing": [999, 1, 1]}
- 
+
             predicted = self._predictor.predict_single_npy_array(
                 img_nnunet, props, None, None,
                 save_or_return_probabilities=True,
             )
- 
+
             if isinstance(predicted, tuple):
                 prob_map = predicted[1]
                 seg_probs = prob_map[1] if prob_map.shape[0] > 1 else prob_map[0]
             else:
                 seg_probs = predicted.astype(np.float32)
- 
+
             results.append(seg_probs[..., np.newaxis])  # (H, W, 1)
- 
+
         if n > 5:
             print(f"  Predicting {n}/{n}... done")
- 
+
         preds = np.array(results, dtype=np.float32)
         return (preds > threshold).astype(np.uint8)
- 
+
     def evaluate(self, X_test, y_test):
         """
         Call self.predict(X_test), then compute dice/iou against y_test with numpy.
         Returns dict: {"dice": ..., "iou": ..., "precision": ..., "recall": ...}.
         """
         preds = self.predict(X_test)
- 
+
         y_true = y_test.flatten().astype(np.float32)
         y_pred = preds.flatten().astype(np.float32)
- 
+
         intersection = np.sum(y_true * y_pred)
         dice = (2.0 * intersection + SMOOTH) / (np.sum(y_true) + np.sum(y_pred) + SMOOTH)
- 
+
         union = np.sum(y_true) + np.sum(y_pred) - intersection
         iou = (intersection + SMOOTH) / (union + SMOOTH)
- 
+
         tp = np.sum(y_true * y_pred)
         precision = (tp + SMOOTH) / (np.sum(y_pred) + SMOOTH)
         recall = (tp + SMOOTH) / (np.sum(y_true) + SMOOTH)
- 
+
         results = {
             "dice": float(dice),
             "iou": float(iou),
             "precision": float(precision),
             "recall": float(recall),
         }
- 
+
         print("\n--- Evaluation Results ---")
         for k, v in results.items():
             print(f"  {k:>12s}: {v:.4f}")
- 
+
         return results
