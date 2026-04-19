@@ -95,7 +95,7 @@ def main() -> None:
     print("\n=== Validating dataset ===")
     model.validate_dataset()
 
-    # 7. Print summary + next step
+    # 7. Print summary and next step
     print("\n=== Setup complete ===")
     print(f"Dataset directory: {dataset_dir}")
     print("Environment paths:")

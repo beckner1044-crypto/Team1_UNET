@@ -48,6 +48,12 @@ masks = model.predict(X_test)
 ```
 ### nnU-Net - Quick Setup
 
+Must install pytorch 
+
+BEFORE
+
+using pip install nnunetv2
+
 ### nnU-Net — load trained model and predict
 
 ```python
