@@ -65,7 +65,7 @@ model = NnUNetSegModel.from_checkpoint(
     folds=(0, 1, 2, 3, 4),  # 5-fold ensemble
 )
 masks = model.predict(X_test)
-metrics = model.evaluate(X_test, y_test)
+metrics = model.evaluate(X_test, y_test)                                                                           
 ```
 
 ### nnU-Net — full training pipeline
